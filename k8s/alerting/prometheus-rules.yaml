@@ -1,0 +1,161 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ai-sre-poc-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: app.pod.alerts
+      rules:
+        # Pod CrashLoopBackOff
+        - alert: PodCrashLoopBackOff
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="apps"}[5m]) > 3
+            and on (namespace, pod)
+            kube_pod_status_phase{namespace="apps", phase="Running"} == 1
+          for: 1m
+          labels:
+            severity: critical
+            category: pod
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash-looping"
+            description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has restarted {{ $value }} times in the last 5 minutes."
+            runbook: "Check container logs and recent deployments."
+
+        # Pod OOMKilled
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{namespace="apps", reason="OOMKilled"} == 1
+            and on (namespace, pod)
+            kube_pod_status_phase{namespace="apps", phase="Running"} == 1
+          for: 0m
+          labels:
+            severity: critical
+            category: memory
+          annotations:
+            summary: "Pod {{ $labels.pod }} was OOMKilled"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} was terminated due to OOM."
+            runbook: "Increase memory limits or investigate memory leak."
+
+        # Pod not ready
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{namespace="apps", condition="true"} == 0
+          for: 2m
+          labels:
+            severity: warning
+            category: pod
+          annotations:
+            summary: "Pod {{ $labels.pod }} is not ready"
+            description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been not ready for more than 2 minutes."
+
+        # High pod restart rate.
+        # The `and on (namespace, pod) ... phase="Running"` guard on these three
+        # rules restricts them to pods that still exist. Prometheus keeps a deleted
+        # pod's series, so increase(...[1h]) kept reporting 5.2 restarts for a pod
+        # that had been gone for many minutes — a critical-looking alert about
+        # nothing. The 1h window made this one linger longest.
+        - alert: HighPodRestartRate
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="apps"}[1h]) > 5
+            and on (namespace, pod)
+            kube_pod_status_phase{namespace="apps", phase="Running"} == 1
+          for: 0m
+          labels:
+            severity: warning
+            category: pod
+          annotations:
+            summary: "High restart rate for pod {{ $labels.pod }}"
+            description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last hour."
+
+    - name: app.http.alerts
+      rules:
+        # High HTTP error rate (5xx)
+        - alert: HighHTTPErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="apps", status=~"5.."}[5m])) by (service)
+              /
+              sum(rate(http_requests_total{namespace="apps"}[5m])) by (service)
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            category: http
+          annotations:
+            summary: "High 5xx error rate on {{ $labels.service }}"
+            description: "Service {{ $labels.service }} has a 5xx error rate of {{ $value | humanizePercentage }}."
+
+        # High HTTP latency
+        - alert: HighHTTPLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{namespace="apps"}[5m])) by (le, service)
+            ) > 2
+          for: 2m
+          labels:
+            severity: warning
+            category: latency
+          annotations:
+            summary: "High p95 latency on {{ $labels.service }}"
+            description: "Service {{ $labels.service }} p95 latency is {{ $value }}s (threshold: 2s)."
+
+    - name: app.resource.alerts
+      rules:
+        # High memory usage
+        - alert: HighMemoryUsage
+          expr: |
+            (
+              container_memory_working_set_bytes{namespace="apps", container!=""}
+              /
+              kube_pod_container_resource_limits{namespace="apps", resource="memory"}
+            ) > 0.85
+          for: 2m
+          labels:
+            severity: warning
+            category: memory
+          annotations:
+            summary: "High memory usage in {{ $labels.pod }}"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of its memory limit."
+
+        # High CPU usage
+        - alert: HighCPUUsage
+          expr: |
+            (
+              rate(container_cpu_usage_seconds_total{namespace="apps", container!=""}[5m])
+              /
+              kube_pod_container_resource_limits{namespace="apps", resource="cpu"}
+            ) > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            category: cpu
+          annotations:
+            summary: "High CPU usage in {{ $labels.pod }}"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of its CPU limit."
+
+    - name: app.deployment.alerts
+      rules:
+        # Deployment replica mismatch
+        - alert: DeploymentReplicaMismatch
+          # Aggregated by (namespace, deployment) so the alert carries only labels
+          # that mean something for a deployment-scoped problem. Without this the
+          # series inherits kube-state-metrics' own pod label, and the agent then
+          # investigates that exporter pod instead of the broken deployment.
+          expr: |
+            max by (namespace, deployment) (
+              kube_deployment_spec_replicas{namespace="apps"}
+            )
+            !=
+            max by (namespace, deployment) (
+              kube_deployment_status_replicas_available{namespace="apps"}
+            )
+          for: 3m
+          labels:
+            severity: warning
+            category: deployment
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} replica mismatch"
+            description: "Deployment {{ $labels.deployment }} has {{ $value }} replicas available vs desired."

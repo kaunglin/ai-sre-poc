@@ -1,0 +1,34 @@
+# =============================================================================
+# ArgoCD Application — the GitOps half of the architecture diagram.
+#
+# Without this, ArgoCD is installed but watches nothing. Set repoURL to your
+# own remote before applying (or let scripts/setup-argocd.sh substitute it
+# from $GIT_REPO_URL).
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-sre-poc
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ai-sre-poc
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/ai-sre-poc.git
+    targetRevision: main
+    path: k8s
+    directory:
+      recurse: true
+      # Exclude this directory so the Application does not manage itself and
+      # overwrite repoURL with the placeholder above.
+      exclude: "argocd/*"
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    # Sync is deliberately manual. An automated policy with selfHeal would
+    # revert the chaos scenarios (bad image tag, lowered memory limit) before
+    # an alert ever fires, so the agent would never see the incident.
+    # Sync from the ArgoCD UI or: argocd app sync ai-sre-poc
+    syncOptions:
+      - CreateNamespace=true

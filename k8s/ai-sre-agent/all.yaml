@@ -1,0 +1,165 @@
+# =============================================================================
+# RBAC — the agent needs read/write access to pods, deployments, events
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-sre-agent
+  namespace: ai-sre-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-sre-agent
+rules:
+  # Read pods, events, services, configmaps
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "configmaps", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Read and patch deployments (for restart / rollback / scale)
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Read HPA
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-sre-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ai-sre-agent
+subjects:
+  - kind: ServiceAccount
+    name: ai-sre-agent
+    namespace: ai-sre-agent
+---
+# =============================================================================
+# ConfigMap
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-sre-agent-config
+  namespace: ai-sre-agent
+data:
+  PROMETHEUS_URL: "http://kube-prometheus-stack-prometheus.monitoring:9090"
+  LOKI_URL: "http://loki.monitoring:3100"
+  WATCH_NAMESPACE: "apps"
+  # Which API analyses incidents. Switch to "anthropic" to use Claude instead;
+  # the matching key must be present in ai-sre-agent-secret.
+  LLM_PROVIDER: "openai"
+  OPENAI_MODEL: "gpt-5.5"
+  CLAUDE_MODEL: "claude-opus-5"
+---
+# =============================================================================
+# Secret — NOT defined here on purpose.
+#
+# scripts/deploy-ai-agent.sh creates ai-sre-agent-secret from the API key in
+# your environment. A placeholder Secret here would overwrite the real key
+# every time this manifest is applied (deploy script re-run, or ArgoCD sync).
+# The secretRef below is optional so the agent still starts without it.
+# =============================================================================
+
+# =============================================================================
+# Deployment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-sre-agent
+  namespace: ai-sre-agent
+  labels:
+    app: ai-sre-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-sre-agent
+  template:
+    metadata:
+      labels:
+        app: ai-sre-agent
+    spec:
+      serviceAccountName: ai-sre-agent
+      containers:
+        - name: ai-sre-agent
+          image: k3d-ai-sre-registry:5111/ai-sre-agent:latest
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: ai-sre-agent-config
+            - secretRef:
+                name: ai-sre-agent-secret
+                optional: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-sre-agent
+  namespace: ai-sre-agent
+  labels:
+    app: ai-sre-agent
+spec:
+  selector:
+    app: ai-sre-agent
+  ports:
+    - port: 5000
+      targetPort: 5000
+
+---
+# =============================================================================
+# Ingress — reach the dashboard without a port-forward.
+#
+# The k3d load balancer publishes ingress-nginx on host port 18080, so this is
+# reachable at http://ai-sre.localhost:18080 . Browsers resolve *.localhost to
+# 127.0.0.1 automatically, so no /etc/hosts entry is needed.
+#
+# A port-forward is a single TCP tunnel bound to one pod: it dies whenever that
+# pod is replaced, the apiserver connection blips, or the laptop sleeps. An
+# Ingress routes through the Service, so it survives pod churn.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-sre-agent
+  namespace: ai-sre-agent
+  labels:
+    app: ai-sre-agent
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ai-sre.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-sre-agent
+                port:
+                  number: 5000

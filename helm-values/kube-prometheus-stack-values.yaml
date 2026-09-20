@@ -1,0 +1,103 @@
+# kube-prometheus-stack Helm values
+# Configured for AI SRE PoC with AlertManager webhook to AI agent
+
+grafana:
+  adminPassword: admin
+  service:
+    type: ClusterIP
+  sidecar:
+    datasources:
+      enabled: true
+    dashboards:
+      enabled: true
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    storageSpec: {}
+    # Scrape the app namespace too
+    podMonitorNamespaceSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+    podMonitorSelector: {}
+    serviceMonitorSelector: {}
+    ruleSelector: {}
+    # Scrape interval
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 2m
+    route:
+      group_by: ['alertname', 'namespace', 'pod']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 5m
+      # Default to dropping. The previous default was 'ai-sre-agent', which
+      # sent *every* alert to the agent — including permanent meta-alerts like
+      # Watchdog (a dead-man's switch that always fires) and InfoInhibitor.
+      # Each one cost an LLM call and filled the dashboard with noise.
+      receiver: 'null'
+      routes:
+        # Monitoring housekeeping — never an application incident.
+        - receiver: 'null'
+          matchers:
+            - alertname =~ "Watchdog|InfoInhibitor"
+        # Real incidents only.
+        - receiver: 'ai-sre-agent'
+          matchers:
+            - severity =~ "critical|warning"
+    receivers:
+      - name: 'ai-sre-agent'
+        webhook_configs:
+          - url: 'http://ai-sre-agent.ai-sre-agent.svc.cluster.local:5000/webhook/alertmanager'
+            send_resolved: true
+      - name: 'null'
+    inhibit_rules:
+      - source_matchers:
+          - severity = critical
+        target_matchers:
+          - severity = warning
+        equal: ['alertname', 'namespace']
+
+# Enable default rules
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubeControllerManager: false
+    kubelet: true
+    kubeProxy: false
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true
+
+# Node exporter
+nodeExporter:
+  enabled: true
+
+# kube-state-metrics
+kubeStateMetrics:
+  enabled: true

@@ -1,0 +1,92 @@
+# CI/CD Pipeline — Build, test, and push container images
+# For the PoC, this targets the local k3d registry.
+# In production, replace with ECR/GCR/ACR.
+
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'k8s/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/**'
+
+env:
+  REGISTRY: localhost:5111  # k3d local registry
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Lint order-service
+        run: |
+          pip install ruff
+          ruff check apps/order-service/
+          ruff check apps/frontend/
+          ruff check apps/ai-sre-agent/
+
+  build-order-service:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build order-service
+        run: |
+          docker build -t ${{ env.REGISTRY }}/order-service:${{ github.sha }} \
+                        -t ${{ env.REGISTRY }}/order-service:latest \
+                        apps/order-service/
+      # In real CI, push to a real registry:
+      # - name: Push
+      #   run: |
+      #     docker push ${{ env.REGISTRY }}/order-service:${{ github.sha }}
+      #     docker push ${{ env.REGISTRY }}/order-service:latest
+
+  build-frontend:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build frontend
+        run: |
+          docker build -t ${{ env.REGISTRY }}/frontend:${{ github.sha }} \
+                        -t ${{ env.REGISTRY }}/frontend:latest \
+                        apps/frontend/
+
+  build-ai-sre-agent:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ai-sre-agent
+        run: |
+          docker build -t ${{ env.REGISTRY }}/ai-sre-agent:${{ github.sha }} \
+                        -t ${{ env.REGISTRY }}/ai-sre-agent:latest \
+                        apps/ai-sre-agent/
+
+  # For production: add deploy job that updates k8s manifests
+  # and lets ArgoCD sync the changes
+  # deploy:
+  #   needs: [build-order-service, build-frontend, build-ai-sre-agent]
+  #   if: github.ref == 'refs/heads/main'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Update image tags in k8s manifests
+  #       run: |
+  #         sed -i "s|order-service:.*|order-service:${{ github.sha }}|g" k8s/apps/all.yaml
+  #         sed -i "s|frontend:.*|frontend:${{ github.sha }}|g" k8s/apps/all.yaml
+  #     - name: Commit and push manifest changes
+  #       run: |
+  #         git config user.name "CI Bot"
+  #         git config user.email "ci@example.com"
+  #         git add k8s/
+  #         git commit -m "ci: update image tags to ${{ github.sha }}" || true
+  #         git push

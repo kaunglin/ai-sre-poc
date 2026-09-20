@@ -1,0 +1,22 @@
+# ArgoCD Helm values for AI SRE PoC
+
+server:
+  service:
+    type: ClusterIP
+  extraArgs:
+    - --insecure  # For local dev, skip TLS
+
+configs:
+  params:
+    server.insecure: true
+
+# Disable dex (not needed for local)
+dex:
+  enabled: false
+
+# Minimal HA for local
+controller:
+  replicas: 1
+
+repoServer:
+  replicas: 1

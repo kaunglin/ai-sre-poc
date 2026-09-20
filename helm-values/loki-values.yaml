@@ -1,0 +1,72 @@
+# Loki-stack Helm values for AI SRE PoC
+
+loki:
+  enabled: true
+  # The loki-stack chart pins grafana/loki:2.6.1, which predates `store: tsdb`
+  # (2.8+) and `schema: v13` (2.9+) configured below — it crash-loops with
+  # "invalid schema config: invalid schema version". Align the image with the
+  # config this file already asks for.
+  image:
+    tag: 2.9.8
+  persistence:
+    enabled: false
+  config:
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      # Base for Loki's derived paths. /data is the chart's emptyDir mount.
+      path_prefix: /data/loki
+      ring:
+        kvstore:
+          store: inmemory
+      replication_factor: 1
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    storage_config:
+      # `store: tsdb` above requires these two paths. They default to the empty
+      # string, which makes Loki fail at startup with `mkdir : no such file or
+      # directory` while initialising the store module.
+      tsdb_shipper:
+        active_index_directory: /data/loki/tsdb-index
+        cache_location: /data/loki/tsdb-cache
+        # Without this the shipper has no object backend and builds a client
+        # with an empty directory — the `mkdir :` failure. The chart sets it
+        # for boltdb_shipper and compactor, but not for a tsdb_shipper block
+        # we add ourselves.
+        shared_store: filesystem
+      filesystem:
+        directory: /data/loki/chunks
+    compactor:
+      # Also defaults to empty and fails the same way once the store is up.
+      working_directory: /data/loki/compactor
+    limits_config:
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      max_query_length: 721h
+
+promtail:
+  enabled: true
+  config:
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    snippets:
+      pipelineStages:
+        - cri: {}
+        - json:
+            expressions:
+              level: level
+              msg: msg
+              timestamp: timestamp
+        - labels:
+            level:
+
+grafana:
+  enabled: false  # Already installed via kube-prometheus-stack
