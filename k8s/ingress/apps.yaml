@@ -1,0 +1,28 @@
+# =============================================================================
+# Ingress for the demo application — http://orders.localhost:18080
+#
+# The frontend proxies /api/* through to order-service, so order-service needs
+# no Ingress of its own. Use a port-forward if you want to hit its fault
+# injection endpoints directly.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: apps
+  labels:
+    app: frontend
+    app.kubernetes.io/part-of: ai-sre-poc
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: orders.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

@@ -277,6 +277,8 @@ kubectl get secret ai-sre-agent-secret -n ai-sre-agent \
 open http://ai-sre.localhost:18080
 ```
 
+Every other UI is on the same port — see [Access](#access) below.
+
 No port-forward needed — an Ingress routes through ingress-nginx, which the k3d
 load balancer publishes on host port 18080. Browsers resolve `*.localhost` to
 127.0.0.1 automatically, so there is no `/etc/hosts` entry to add.
@@ -288,16 +290,34 @@ load balancer publishes on host port 18080. Browsers resolve `*.localhost` to
 
 Click **Trigger test alert** to run the full pipeline against a synthetic incident.
 
-### Other UIs
+### Access
 
-| Service | Command | URL |
+Everything is reachable through ingress-nginx on host port **18080** — no port-forwards.
+Browsers resolve `*.localhost` to 127.0.0.1 automatically, so there is nothing to add to
+`/etc/hosts`.
+
+| Service | URL | Credentials |
 |---|---|---|
-| **AI SRE Agent** | *(none — Ingress)* | **http://ai-sre.localhost:18080** |
-| Grafana | `kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80` | http://localhost:3000 (admin/admin) |
-| Prometheus | `kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090` | http://localhost:9090 |
-| AlertManager | `kubectl port-forward -n monitoring svc/kube-prometheus-stack-alertmanager 9093:9093` | http://localhost:9093 |
-| ArgoCD | `kubectl port-forward -n argocd svc/argocd-server 8443:443` | https://localhost:8443 |
-| Frontend | `kubectl port-forward -n apps svc/frontend 3001:3000` | http://localhost:3001 |
+| **AI SRE Agent** | http://ai-sre.localhost:18080 | — |
+| **Order app** | http://orders.localhost:18080 | — |
+| **Grafana** | http://grafana.localhost:18080 | admin / admin |
+| **Prometheus** | http://prometheus.localhost:18080 | — |
+| **AlertManager** | http://alertmanager.localhost:18080 | — |
+| **ArgoCD** | http://argocd.localhost:18080 | admin / see below |
+
+```bash
+# ArgoCD initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+```
+
+> **Don't forget the `:18080`.** The k3d load balancer publishes ingress-nginx there
+> rather than on port 80, deliberately leaving 8080/8443 free. Omitting the port gives
+> "connection refused", which looks like a cluster problem but isn't.
+
+Port-forwards still work if you prefer them, but an Ingress routes through the Service, so
+it survives pod restarts and remediations — a port-forward is bound to one pod and drops
+exactly when a chaos test gets interesting.
 
 ---
 
@@ -335,6 +355,7 @@ ai-sre-poc/
 │   ├── apps/all.yaml              # PostgreSQL, Redis, order-service, frontend, ServiceMonitors
 │   ├── ai-sre-agent/all.yaml      # RBAC, ConfigMap, Deployment, Service
 │   ├── alerting/prometheus-rules.yaml  # 9 custom alert rules
+│   ├── ingress/                   # Ingress per namespace (argocd, monitoring, apps)
 │   └── argocd/application.yaml    # GitOps Application (set repoURL)
 ├── helm-values/                   # chart overrides for Prometheus, Loki, ArgoCD
 ├── scripts/

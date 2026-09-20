@@ -31,6 +31,9 @@ kubectl wait --for=condition=Ready pods -l app=postgres -n apps --timeout=120s
 echo "Waiting for Redis to be ready..."
 kubectl wait --for=condition=Ready pods -l app=redis -n apps --timeout=60s
 
+# Ingress for the demo frontend
+kubectl apply -f "${PROJECT_DIR}/k8s/ingress/apps.yaml"
+
 # `kubectl apply` is a no-op when only the image contents changed behind a
 # floating :latest tag — the manifest is byte-identical, so no new pod is
 # created and the freshly pushed image is never pulled. Force a rollout so

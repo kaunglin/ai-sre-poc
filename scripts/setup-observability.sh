@@ -30,6 +30,11 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
 echo "Applying custom alert rules..."
 kubectl apply -f "${PROJECT_DIR}/k8s/alerting/"
 
+# Ingress for Grafana / Prometheus / AlertManager. Applied here because this
+# script owns the monitoring namespace.
+echo "Applying monitoring ingress..."
+kubectl apply -f "${PROJECT_DIR}/k8s/ingress/monitoring.yaml"
+
 # Install Loki for log aggregation
 echo "Installing Loki..."
 helm upgrade --install loki grafana/loki-stack \

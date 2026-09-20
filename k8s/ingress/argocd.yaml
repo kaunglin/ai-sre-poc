@@ -1,0 +1,33 @@
+# =============================================================================
+# Ingress for the ArgoCD UI — http://argocd.localhost:18080
+#
+# helm-values/argocd-values.yaml runs the server with --insecure (plain HTTP on
+# port 80), so this needs no TLS backend annotation. If you ever remove that
+# flag, add:
+#   nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+# and point the backend at port 443.
+#
+# Username: admin. Password:
+#   kubectl -n argocd get secret argocd-initial-admin-secret \
+#     -o jsonpath='{.data.password}' | base64 -d
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ai-sre-poc
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: argocd.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 80

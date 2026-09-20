@@ -1,0 +1,52 @@
+# =============================================================================
+# Ingress for the observability stack.
+#
+# Reachable on the k3d load balancer's host port 18080:
+#   http://grafana.localhost:18080       (admin / admin)
+#   http://prometheus.localhost:18080
+#   http://alertmanager.localhost:18080
+#
+# Browsers resolve *.localhost to 127.0.0.1, so no /etc/hosts entry is needed.
+# An Ingress must live in the same namespace as the Service it targets, which
+# is why these are split per namespace rather than kept in one file.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: monitoring
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: ai-sre-poc
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-grafana
+                port:
+                  number: 80
+    - host: prometheus.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-prometheus
+                port:
+                  number: 9090
+    - host: alertmanager.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-alertmanager
+                port:
+                  number: 9093

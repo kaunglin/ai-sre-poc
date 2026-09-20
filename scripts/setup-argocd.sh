@@ -24,6 +24,10 @@ helm upgrade --install argocd argo/argo-cd \
 echo "Waiting for ArgoCD server..."
 kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=argocd-server -n argocd --timeout=120s
 
+# Ingress for the ArgoCD UI
+echo "Applying ArgoCD ingress..."
+kubectl apply -f "${PROJECT_DIR}/k8s/ingress/argocd.yaml"
+
 # Register the GitOps Application. ArgoCD watches nothing without one.
 if [ -n "${GIT_REPO_URL:-}" ]; then
   echo "Registering ArgoCD Application for ${GIT_REPO_URL}..."
