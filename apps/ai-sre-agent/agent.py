@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 import anthropic
@@ -23,8 +23,9 @@ import httpx
 import openai
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response
-from kubernetes import client as k8s_client, config as k8s_config
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -22,8 +22,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Lint order-service
@@ -37,7 +37,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build order-service
         run: |
           docker build -t ${{ env.REGISTRY }}/order-service:${{ github.sha }} \
@@ -53,7 +53,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build frontend
         run: |
           docker build -t ${{ env.REGISTRY }}/frontend:${{ github.sha }} \
@@ -64,7 +64,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build ai-sre-agent
         run: |
           docker build -t ${{ env.REGISTRY }}/ai-sre-agent:${{ github.sha }} \
@@ -78,7 +78,7 @@ jobs:
   #   if: github.ref == 'refs/heads/main'
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v7
   #     - name: Update image tags in k8s manifests
   #       run: |
   #         sed -i "s|order-service:.*|order-service:${{ github.sha }}|g" k8s/apps/all.yaml
