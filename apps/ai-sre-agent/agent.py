@@ -67,6 +67,20 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")  # Optional
 NAMESPACE = os.getenv("WATCH_NAMESPACE", "apps")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
 
+# How the agent gathers evidence:
+#   dossier — Python runs a fixed set of queries and pastes the results into one
+#             prompt. Predictable cost and latency; blind to anything the fixed
+#             queries do not capture.
+#   tools   — the model drives its own investigation through read-only tools.
+#             Better on unfamiliar incidents, variable cost, needs a loop cap.
+# This is the boot default; the dashboard can override it at runtime.
+INVESTIGATION_MODE = os.getenv("INVESTIGATION_MODE", "dossier").strip().lower()
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "8"))
+MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "8000"))
+
+# Runtime overrides from the dashboard. In-memory, like the incident store.
+runtime_config = {"investigation_mode": INVESTIGATION_MODE}
+
 # Resolved once so the "no key" path can name the variable the operator must set.
 LLM_API_KEY_VAR = "OPENAI_API_KEY" if LLM_PROVIDER == "openai" else "ANTHROPIC_API_KEY"
 LLM_API_KEY = OPENAI_API_KEY if LLM_PROVIDER == "openai" else ANTHROPIC_API_KEY
@@ -77,6 +91,7 @@ LLM_API_KEY = OPENAI_API_KEY if LLM_PROVIDER == "openai" else ANTHROPIC_API_KEY
 
 ALERTS_RECEIVED = Counter("ai_sre_alerts_received_total", "Alerts received", ["severity"])
 ANALYSES_COMPLETED = Counter("ai_sre_analyses_completed_total", "AI analyses completed")
+TOOL_CALLS = Counter("ai_sre_tool_calls_total", "Investigation tool calls", ["tool"])
 INCIDENTS_AUTO_RESOLVED = Counter(
     "ai_sre_incidents_auto_resolved_total",
     "Incidents closed because the alert cleared without remediation",
@@ -121,6 +136,10 @@ class Incident:
         self.recommended_action = ""
         self.recommended_action_type = ""  # restart_pod, rollback, scale, manual
         self.recommended_action_params = {}
+        # Every analysis run against this incident, oldest first. The fields
+        # above mirror the most recent one — that is what Approve acts on — so
+        # re-investigating never leaves an ambiguous recommendation on screen.
+        self.analyses: list[dict] = []
         # Remediation
         self.remediation_result = ""
         self.timeline: list[dict] = []
@@ -153,6 +172,7 @@ class Incident:
             # deployment and replica count is not a meaningful review.
             "recommended_action_params": self.recommended_action_params,
             "remediation_result": self.remediation_result,
+            "analyses": self.analyses,
             "timeline": self.timeline,
         }
 
@@ -310,6 +330,29 @@ def get_k8s_context(namespace: str, pod_name: str = "") -> str:
     return "\n\n".join(context_parts)
 
 
+def get_pod_logs(pod: str, namespace: str = "", container: str = "",
+                 previous: bool = False, tail_lines: int = 200) -> str:
+    """Read logs straight from a pod via the Kubernetes API.
+
+    Loki only ever sees the error-filtered view. On an unfamiliar incident the
+    useful evidence is often what Loki filtered out: the lines *before* the
+    error, the startup sequence, or the logs of a container that already died
+    (previous=True). The ServiceAccount already holds pods/log.
+    """
+    namespace = namespace or NAMESPACE
+    try:
+        kwargs = {"name": pod, "namespace": namespace, "tail_lines": tail_lines}
+        if container:
+            kwargs["container"] = container
+        if previous:
+            kwargs["previous"] = True
+        body = core_v1.read_namespaced_pod_log(**kwargs)
+        label = f"{pod}{' (previous container)' if previous else ''}"
+        return f"Logs for {label}:\n{body}" if body else f"Logs for {label}: (empty)"
+    except Exception as e:
+        return f"Could not read logs for {pod} in {namespace}: {e}"
+
+
 async def gather_investigation_context(incident: Incident) -> None:
     """Gather all context needed for AI analysis."""
     incident.add_event("Gathering metrics from Prometheus")
@@ -405,6 +448,175 @@ For complex or risky situations, recommend "manual" with clear instructions.
 """
 
 
+# ---------------------------------------------------------------------------
+# Tool-driven investigation
+#
+# The same functions the dossier path calls on a fixed schedule, exposed so the
+# model can choose what to look at. Strictly read-only: remediation stays behind
+# the approval gate and its five fixed verbs. Widening the *investigation*
+# surface is safe; widening the *action* surface is not.
+# ---------------------------------------------------------------------------
+
+TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "query_prometheus",
+        "description": "Run a PromQL query. Use for restart counts, pod phase, memory, "
+                       "CPU, request rates and latency percentiles.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "PromQL expression"},
+        }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "query_loki",
+        "description": "Run a LogQL query over the last 15 minutes of logs. Good for "
+                       "finding errors across a namespace.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string",
+                      "description": 'LogQL, e.g. {namespace="apps"} |~ "(?i)error"'},
+            "limit": {"type": "integer", "description": "Max lines, default 50"},
+        }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_k8s_context",
+        "description": "Pod status and container states, all pods in the namespace with "
+                       "restart counts, the last 15 events, and deployment replica counts "
+                       "and images.",
+        "parameters": {"type": "object", "properties": {
+            "namespace": {"type": "string"},
+            "pod_name": {"type": "string", "description": "Optional, to focus one pod"},
+        }, "required": ["namespace"]}}},
+    {"type": "function", "function": {
+        "name": "get_pod_logs",
+        "description": "Read raw logs from one pod. Use when the Loki error filter is not "
+                       "enough: full context around a failure, the startup sequence, or "
+                       "the logs of a container that already crashed (previous=true).",
+        "parameters": {"type": "object", "properties": {
+            "pod": {"type": "string"},
+            "namespace": {"type": "string", "description": "Defaults to the watched namespace"},
+            "container": {"type": "string", "description": "Optional"},
+            "previous": {"type": "boolean",
+                         "description": "Logs from the last terminated container"},
+            "tail_lines": {"type": "integer", "description": "Default 200"},
+        }, "required": ["pod"]}}},
+]
+
+TOOL_IMPLS = {
+    "query_prometheus": query_prometheus,
+    "query_loki": query_loki,
+    "get_k8s_context": get_k8s_context,
+    "get_pod_logs": get_pod_logs,
+}
+
+
+def _build_tool_prompt(incident: Incident) -> str:
+    """Opening prompt for tool mode: the alert only, plus the JSON contract.
+
+    Deliberately withholds the dossier — the point of this mode is that the
+    model decides what evidence it needs.
+    """
+    return f"""You are an AI SRE agent investigating a production incident on a Kubernetes cluster.
+
+ALERT DETAILS:
+- Alert: {incident.alert_name}
+- Severity: {incident.severity}
+- Summary: {incident.summary}
+- Description: {incident.description}
+- Affected pod: {incident.pod or 'N/A'}
+- Namespace: {incident.namespace}
+
+Investigate using the available tools. Gather the evidence you actually need —
+metrics, logs, and Kubernetes state — before concluding. If the error filter in
+Loki is not revealing the cause, read the pod's raw logs; for a container that
+has already crashed, read its previous logs.
+
+When you have enough evidence, reply with ONLY this JSON object and no other
+text, no markdown fences:
+{{
+  "root_cause": "One clear sentence describing the root cause",
+  "severity": "critical|high|medium|low",
+  "analysis": "Detailed reasoning: what evidence points to this conclusion, which
+               tool results were decisive, and any contributing factors",
+  "recommended_action": "Specific action to take, described clearly",
+  "action_type": "restart_pods|rollback_deployment|scale_up|adjust_resources|manual",
+  "action_params": {{"deployment": "deployment-name", "namespace": "namespace"}},
+  "confidence": "high|medium|low",
+  "risk_level": "low|medium|high"
+}}
+
+Only recommend an automated action when the evidence identifies a cause that
+action would fix. Use "manual" for genuine ambiguity — not merely for low urgency."""
+
+
+def _summarise_args(args: dict) -> str:
+    """Short one-line rendering of tool arguments for the incident timeline."""
+    parts = []
+    for k, v in args.items():
+        text = str(v)
+        parts.append(f"{k}={text[:60] + '…' if len(text) > 60 else text}")
+    return ", ".join(parts)
+
+
+async def _run_tool(name: str, args: dict) -> str:
+    impl = TOOL_IMPLS.get(name)
+    if impl is None:
+        return f"Unknown tool: {name}"
+    TOOL_CALLS.labels(name).inc()
+    try:
+        if asyncio.iscoroutinefunction(impl):
+            result = await impl(**args)
+        else:
+            result = await asyncio.to_thread(impl, **args)
+    except TypeError as e:
+        return f"Invalid arguments for {name}: {e}"
+    except Exception as e:
+        return f"{name} failed: {e}"
+    return str(result)[:MAX_TOOL_RESULT_CHARS]
+
+
+async def _investigate_with_tools(incident: Incident) -> tuple[str, int]:
+    """Let the model drive. Returns (raw response text, tool call count)."""
+    client = openai.AsyncOpenAI(api_key=LLM_API_KEY)
+    messages = [{"role": "user", "content": _build_tool_prompt(incident)}]
+    calls = 0
+
+    for _ in range(MAX_TOOL_ITERATIONS):
+        response = await client.chat.completions.create(
+            model=OPENAI_MODEL, messages=messages, tools=TOOL_SCHEMA,
+        )
+        message = response.choices[0].message
+        messages.append(message)
+
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return (message.content or "").strip(), calls
+
+        for call in tool_calls:
+            # v3 distinguishes function tools from custom tools; only ours apply.
+            if getattr(call, "type", "function") != "function":
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": "Unsupported tool type"})
+                continue
+            name = call.function.name
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            calls += 1
+            incident.add_event(f"Tool: {name}({_summarise_args(args)})")
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": await _run_tool(name, args)})
+
+    # Budget spent. Ask for a conclusion from whatever was gathered rather than
+    # returning nothing — a partial analysis still beats an empty incident.
+    incident.add_event(f"Tool budget exhausted after {MAX_TOOL_ITERATIONS} rounds")
+    messages.append({"role": "user", "content":
+                     "Tool budget exhausted. Respond now with the JSON object, "
+                     "using the evidence you already have."})
+    final = await client.chat.completions.create(
+        model=OPENAI_MODEL, messages=messages,
+        response_format={"type": "json_object"},
+    )
+    return (final.choices[0].message.content or "").strip(), calls
+
+
 async def _complete_openai(prompt: str) -> str:
     """Ask OpenAI for the analysis and return the raw response text."""
     client = openai.AsyncOpenAI(api_key=LLM_API_KEY)
@@ -429,9 +641,18 @@ async def _complete_anthropic(prompt: str) -> str:
     return response.content[0].text.strip()
 
 
-async def analyze_incident(incident: Incident) -> None:
-    """Send investigation context to the configured LLM for root cause analysis."""
-    incident.add_event(f"Sending context to {LLM_PROVIDER} for analysis")
+async def analyze_incident(incident: Incident, mode: str | None = None) -> None:
+    """Analyse an incident and record the result as the active recommendation.
+
+    `mode` selects how evidence is gathered — "dossier" (fixed queries, one
+    call) or "tools" (model-driven, several calls). Defaults to the runtime
+    setting. Every run is appended to incident.analyses so the same incident can
+    be investigated both ways and compared.
+    """
+    mode = (mode or runtime_config["investigation_mode"]).lower()
+    started = datetime.now(timezone.utc)
+    tool_calls = 0
+    incident.add_event(f"Analysing via {LLM_PROVIDER} ({mode} mode)")
 
     if not LLM_API_KEY:
         incident.ai_analysis = f"{LLM_API_KEY_VAR} not set — skipping AI analysis"
@@ -441,18 +662,26 @@ async def analyze_incident(incident: Incident) -> None:
         incident.status = IncidentStatus.AWAITING_APPROVAL
         return
 
-    prompt = _build_analysis_prompt(incident)
     response_text = ""
 
     try:
-        if LLM_PROVIDER == "openai":
-            response_text = await _complete_openai(prompt)
-        elif LLM_PROVIDER == "anthropic":
-            response_text = await _complete_anthropic(prompt)
+        if mode == "tools":
+            if LLM_PROVIDER != "openai":
+                raise ValueError("tools mode currently requires LLM_PROVIDER=openai")
+            response_text, tool_calls = await _investigate_with_tools(incident)
         else:
-            raise ValueError(
-                f"Unknown LLM_PROVIDER {LLM_PROVIDER!r} (expected 'openai' or 'anthropic')"
-            )
+            # Dossier mode gathers evidence up front, on a fixed schedule.
+            if not incident.metrics_context:
+                await gather_investigation_context(incident)
+            prompt = _build_analysis_prompt(incident)
+            if LLM_PROVIDER == "openai":
+                response_text = await _complete_openai(prompt)
+            elif LLM_PROVIDER == "anthropic":
+                response_text = await _complete_anthropic(prompt)
+            else:
+                raise ValueError(
+                    f"Unknown LLM_PROVIDER {LLM_PROVIDER!r} (expected 'openai' or 'anthropic')"
+                )
 
         # Clean up potential markdown formatting
         if response_text.startswith("```"):
@@ -471,8 +700,25 @@ async def analyze_incident(incident: Incident) -> None:
 
         confidence = analysis.get("confidence", "unknown")
         risk = analysis.get("risk_level", "unknown")
+        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        incident.analyses.append({
+            "mode": mode,
+            "provider": LLM_PROVIDER,
+            "model": OPENAI_MODEL if LLM_PROVIDER == "openai" else CLAUDE_MODEL,
+            "at": started.isoformat(),
+            "duration_s": round(duration, 1),
+            "tool_calls": tool_calls,
+            "root_cause": incident.root_cause,
+            "analysis": incident.ai_analysis,
+            "recommended_action": incident.recommended_action,
+            "action_type": incident.recommended_action_type,
+            "action_params": incident.recommended_action_params,
+            "confidence": confidence,
+            "risk_level": risk,
+        })
         incident.add_event(
-            f"AI analysis complete — confidence: {confidence}, risk: {risk}"
+            f"Analysis complete ({mode}, {duration:.0f}s, {tool_calls} tool calls) "
+            f"— confidence: {confidence}, risk: {risk}"
         )
 
         ANALYSES_COMPLETED.inc()
@@ -782,7 +1028,6 @@ async def alertmanager_webhook(request: Request):
 async def investigate_incident(incident: Incident):
     """Full investigation pipeline: gather context → AI analysis → notify."""
     try:
-        await gather_investigation_context(incident)
         await analyze_incident(incident)
         await notify_slack(incident)
         logger.info(
@@ -844,6 +1089,61 @@ async def reject_incident(incident_id: str):
     incident.status = IncidentStatus.REJECTED
     incident.add_event("Engineer rejected automated remediation — handling manually")
     logger.info(f"Incident {incident_id}: remediation rejected by engineer")
+    return incident.to_dict()
+
+
+# Investigation mode — read and set at runtime
+@app.get("/api/config")
+async def get_config():
+    return {
+        "investigation_mode": runtime_config["investigation_mode"],
+        "modes": ["dossier", "tools"],
+        "provider": LLM_PROVIDER,
+        "max_tool_iterations": MAX_TOOL_ITERATIONS,
+    }
+
+
+@app.post("/api/config")
+async def set_config(request: Request):
+    body = await request.json()
+    mode = str(body.get("investigation_mode", "")).lower()
+    if mode not in ("dossier", "tools"):
+        return Response(status_code=400, media_type="application/json",
+                        content=json.dumps({"error": "mode must be 'dossier' or 'tools'"}))
+    if mode == "tools" and LLM_PROVIDER != "openai":
+        return Response(status_code=400, media_type="application/json",
+                        content=json.dumps({
+                            "error": "tools mode currently requires LLM_PROVIDER=openai"}))
+    runtime_config["investigation_mode"] = mode
+    logger.info(f"Investigation mode set to {mode}")
+    return {"investigation_mode": mode}
+
+
+# Re-run the analysis on an existing incident, optionally in a different mode.
+# The point is comparison: same alert, same cluster state, two approaches.
+@app.post("/api/incidents/{incident_id}/reinvestigate")
+async def reinvestigate_incident(incident_id: str, request: Request):
+    incident = incidents.get(incident_id)
+    if not incident:
+        return Response(status_code=404, media_type="application/json",
+                        content=json.dumps({"error": "Incident not found"}))
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = str(body.get("mode") or runtime_config["investigation_mode"]).lower()
+    if mode not in ("dossier", "tools"):
+        return Response(status_code=400, media_type="application/json",
+                        content=json.dumps({"error": "mode must be 'dossier' or 'tools'"}))
+
+    # Re-analysing is an observation, not a state change: an incident awaiting
+    # approval stays awaiting approval, a resolved one stays resolved.
+    previous_status = incident.status
+    incident.add_event(f"Re-investigating in {mode} mode")
+    await analyze_incident(incident, mode=mode)
+    if previous_status not in (IncidentStatus.INVESTIGATING,
+                               IncidentStatus.AWAITING_APPROVAL):
+        incident.status = previous_status
     return incident.to_dict()
 
 
@@ -932,6 +1232,15 @@ h1{font-size:1.5rem;margin-bottom:.25rem;color:#fff}
 .params{margin-top:.4rem;font-size:.78rem;color:#93c5fd;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .params .k{color:#8b8b96}
 .manual-note{font-size:.8rem;color:#fbbf24;align-self:center}
+.modebar{display:flex;align-items:center;gap:.6rem;background:#1a1b26;border-radius:8px;padding:.5rem .9rem;margin-bottom:1rem;font-size:.8rem;color:#8b8b96}
+.modebar select{background:#12131d;color:#e1e1e6;border:1px solid #333;border-radius:5px;padding:.3rem .5rem;font-size:.8rem}
+.modebar .hint{color:#6b7280}
+.btn-reinv{background:#1e3a5f;color:#93c5fd}.btn-reinv:hover{background:#25497a}
+.runmeta{font-size:.72rem;color:#6b7280;margin-top:.35rem}
+.prev{margin-top:.75rem;border-top:1px solid #262735;padding-top:.5rem}
+.prev summary{cursor:pointer;font-size:.75rem;color:#8b8b96}
+.prev-item{background:#101119;border-radius:6px;padding:.6rem;margin-top:.5rem;font-size:.8rem;color:#c8c8d0}
+.prev-item .h{color:#93c5fd;font-size:.72rem;margin-bottom:.25rem}
 .actions{display:flex;gap:.5rem;margin-top:.75rem}
 .btn{padding:.5rem 1.25rem;border:none;border-radius:6px;font-size:.8rem;font-weight:600;cursor:pointer;transition:all .15s}
 .btn-approve{background:#16a34a;color:#fff}.btn-approve:hover{background:#15803d}
@@ -961,6 +1270,15 @@ h1{font-size:1.5rem;margin-bottom:.25rem;color:#fff}
   <div class="stat"><div class="stat-value" id="resolved_count" style="color:#22c55e">0</div><div class="stat-label">Closed</div></div>
 </div>
 
+<div class="modebar">
+  <span>Investigation mode</span>
+  <select id="mode" onchange="setMode(this.value)">
+    <option value="dossier">Dossier — fixed queries, one call</option>
+    <option value="tools">Tool-driven — model chooses what to look at</option>
+  </select>
+  <span class="hint" id="modehint"></span>
+</div>
+
 <div id="incidents"><div class="empty">No incidents yet. Trigger a test alert or wait for real alerts.</div></div>
 <p class="refresh-note">Auto-refreshes every 5 seconds</p>
 
@@ -980,6 +1298,43 @@ async function loadIncidents(){
     if(!data.length){document.getElementById('incidents').innerHTML='<div class="empty">No incidents yet.</div>';return}
     document.getElementById('incidents').innerHTML=data.map(renderIncident).join('');
   }catch(e){console.error(e)}
+}
+
+async function loadConfig(){
+  try{
+    const c=await (await fetch(API+'/config')).json();
+    document.getElementById('mode').value=c.investigation_mode;
+    document.getElementById('modehint').textContent =
+      c.investigation_mode==='tools'
+        ? `up to ${c.max_tool_iterations} tool calls per incident`
+        : 'predictable cost and latency';
+  }catch(e){console.error(e)}
+}
+async function setMode(mode){
+  const r=await fetch(API+'/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({investigation_mode:mode})});
+  if(!r.ok){const d=await r.json().catch(()=>({}));alert(d.error||'Could not change mode');}
+  loadConfig();
+}
+async function reinvestigate(id,mode){
+  const btn=event&&event.target; if(btn){btn.disabled=true;btn.textContent='Investigating…';}
+  const r=await fetch(API+'/incidents/'+id+'/reinvestigate',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
+  if(!r.ok){const d=await r.json().catch(()=>({}));alert(d.error||'Re-investigation failed');}
+  loadIncidents();
+}
+
+// Earlier runs against the same incident, so two modes can be compared.
+function renderPrevious(i){
+  const prior=(i.analyses||[]).slice(0,-1);
+  if(!prior.length) return '';
+  return `<details class="prev"><summary>Previous analyses (${prior.length})</summary>` +
+    prior.map(a=>`<div class="prev-item">
+      <div class="h">${esc(a.mode)} · ${esc(a.model||'')} · ${esc(a.duration_s)}s · ${esc(a.tool_calls)} tool calls · confidence ${esc(a.confidence)}</div>
+      <div><b>${esc(a.root_cause)}</b></div>
+      <div>${esc(a.analysis)}</div>
+      <div class="params"><span class="k">action:</span> ${esc(a.action_type)}</div>
+    </div>`).join('') + `</details>`;
 }
 
 // The approval gate must show the arguments, not just the verb.
@@ -1013,18 +1368,26 @@ function renderIncident(i){
       <div class="analysis">${esc(i.ai_analysis)}</div></div>`:''}
     ${i.recommended_action?`<div class="section"><div class="section-label">Recommended action (${esc(i.recommended_action_type)})</div>
       <div class="analysis">${esc(i.recommended_action)}</div>
-      ${i.recommended_action_type&&i.recommended_action_type!=='manual'?renderParams(i.recommended_action_params):''}</div>`:''}
+      ${i.recommended_action_type&&i.recommended_action_type!=='manual'?renderParams(i.recommended_action_params):''}
+      ${(i.analyses||[]).length?`<div class="runmeta">${esc(i.analyses.at(-1).mode)} mode · ${esc(i.analyses.at(-1).duration_s)}s · ${esc(i.analyses.at(-1).tool_calls)} tool calls · confidence ${esc(i.analyses.at(-1).confidence)}</div>`:''}</div>`:''}
     ${i.remediation_result?`<div class="section"><div class="section-label">Remediation result</div>
       <div class="analysis">${esc(i.remediation_result)}</div></div>`:''}
     ${i.status==='awaiting_approval'?(i.recommended_action_type==='manual'
       ? `<div class="actions">
       <button class="btn btn-reject" onclick="reject('${esc(i.id)}')">Close (handled manually)</button>
+      <button class="btn btn-reinv btn-sm" onclick="reinvestigate('${esc(i.id)}','tools')">&#8635; Re-investigate with tools</button>
       <span class="manual-note">No automated remediation — the agent proposes no action it can execute.</span>
     </div>`
       : `<div class="actions">
       <button class="btn btn-approve" onclick="approve('${esc(i.id)}')">Approve &amp; execute</button>
       <button class="btn btn-reject" onclick="reject('${esc(i.id)}')">Reject (handle manually)</button>
+      <button class="btn btn-reinv btn-sm" onclick="reinvestigate('${esc(i.id)}','tools')">&#8635; Re-investigate with tools</button>
     </div>`):''}
+    ${renderPrevious(i)}
+    ${['resolved','auto_resolved','rejected','failed'].includes(i.status)?`<div class="actions">
+      <button class="btn btn-reinv btn-sm" onclick="reinvestigate('${esc(i.id)}','tools')">&#8635; Re-investigate with tools</button>
+      <button class="btn btn-reinv btn-sm" onclick="reinvestigate('${esc(i.id)}','dossier')">&#8635; Re-investigate (dossier)</button>
+    </div>`:''}
     ${i.timeline?.length?`<div class="section"><div class="section-label">Timeline</div>
       <div class="timeline">${i.timeline.map(t=>
         `<div class="timeline-entry"><span class="time">${new Date(t.time).toLocaleTimeString()}</span> ${esc(t.event)}</div>`
@@ -1048,7 +1411,7 @@ async function testAlert(){
   await fetch(API+'/test-alert',{method:'POST'});
   setTimeout(loadIncidents,1000);setTimeout(loadIncidents,5000);setTimeout(loadIncidents,15000);
 }
-loadIncidents();setInterval(loadIncidents,5000);
+loadConfig();loadIncidents();setInterval(loadIncidents,5000);
 </script>
 </body></html>"""
 
