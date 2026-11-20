@@ -16,10 +16,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events", "services", "configmaps", "namespaces"]
     verbs: ["get", "list", "watch"]
-  # Read and patch deployments (for restart / rollback / scale)
+  # Patch deployments — the only write the agent makes. Every remediation
+  # (restart / rollback / scale / adjust_resources) is a patch_namespaced_deployment
+  # call, so there is no "update" (full replace) and no write on anything else.
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Read replicasets (rollback reads the previous revision's pod template) and
+  # statefulsets (cluster context).
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
   # Read HPA
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
@@ -55,6 +62,29 @@ data:
   LLM_PROVIDER: "openai"
   OPENAI_MODEL: "gpt-5.5"
   CLAUDE_MODEL: "claude-opus-5"
+  # Dashboard sign-in user. The password, session key and webhook token live in
+  # ai-sre-agent-secret, created by scripts/deploy-ai-agent.sh.
+  DASHBOARD_USERNAME: "admin"
+  # Incident history (SQLite) — on the PersistentVolumeClaim below.
+  DATA_DIR: "/data"
+---
+# =============================================================================
+# Incident history volume. k3d ships the local-path provisioner, so this is a
+# directory on whichever node the pod first lands on. ReadWriteOnce is enough:
+# the agent is a single writer (replicas: 1).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ai-sre-agent-data
+  namespace: ai-sre-agent
+  labels:
+    app: ai-sre-agent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
 ---
 # =============================================================================
 # Secret — NOT defined here on purpose.
@@ -77,6 +107,11 @@ metadata:
     app: ai-sre-agent
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: the old pod must release the ReadWriteOnce
+  # volume (and stop writing SQLite) before the new one starts. A rolling update
+  # would run two writers, or leave the new pod stuck waiting for the volume.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ai-sre-agent
@@ -97,6 +132,9 @@ spec:
             - secretRef:
                 name: ai-sre-agent-secret
                 optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
           resources:
             requests:
               memory: "128Mi"
@@ -116,6 +154,10 @@ spec:
               port: 5000
             initialDelaySeconds: 5
             periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ai-sre-agent-data
 ---
 apiVersion: v1
 kind: Service

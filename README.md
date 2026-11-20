@@ -132,11 +132,12 @@ Anything unrecognised is rejected and nothing happens.
 
 1. **Fixed action vocabulary** — the model picks a verb from a list; it never writes shell
    or `kubectl`
-2. **Human approval** — nothing touches the cluster until you approve, and the dashboard
-   shows the exact parameters that will be patched
-3. **RBAC** — the ServiceAccount can *read* pods, logs, events and services, and can only
-   *patch* deployments, replicasets and statefulsets. It cannot delete anything, read
-   secrets, or create resources
+2. **Human approval** — nothing touches the cluster until a signed-in engineer approves in
+   a dialog that shows the exact parameters that will be patched; the timeline records who
+   approved. AlertManager authenticates to the webhook with its own bearer token
+3. **RBAC** — the ServiceAccount can *read* pods, logs, events, services and replicasets,
+   and its only write is *patch* on deployments. It cannot delete anything, read secrets,
+   create resources, or replace an object wholesale (`update`)
 
 Implementation detail is in **[CLAUDE.md](CLAUDE.md)**.
 
@@ -162,7 +163,9 @@ Each script is idempotent. Step 2 is the slow one (5–8 minutes).
 To use Claude instead of OpenAI, export `ANTHROPIC_API_KEY` and set
 `LLM_PROVIDER: "anthropic"` in `k8s/ai-sre-agent/all.yaml`. Both SDKs ship in the image.
 
-Then open the dashboard and click **Trigger test alert**.
+Then sign in to the dashboard (password below) and click **Trigger test alert**. The
+dashboard keeps 7 days of incidents, filters by time range, searches names, analysis and
+the logs the agent collected, and lets you minimise or maximise each incident.
 
 ### Access
 
@@ -171,12 +174,22 @@ resolve `*.localhost` to 127.0.0.1, so there is nothing to add to `/etc/hosts`.
 
 | Service | URL | Credentials |
 |---|---|---|
-| **AI SRE Agent** | http://ai-sre.localhost:18080 | — |
+| **AI SRE Agent** | http://ai-sre.localhost:18080 | admin / below |
 | **Order app** | http://orders.localhost:18080 | — |
 | **Grafana** | http://grafana.localhost:18080 | admin / admin |
 | **Prometheus** | http://prometheus.localhost:18080 | — |
 | **AlertManager** | http://alertmanager.localhost:18080 | — |
 | **ArgoCD** | http://argocd.localhost:18080 | admin / below |
+
+The AI SRE dashboard password is generated on the first deploy and kept on redeploys
+(export `DASHBOARD_PASSWORD` before deploying to choose your own):
+
+```bash
+kubectl -n ai-sre-agent get secret ai-sre-agent-secret \
+  -o jsonpath='{.data.DASHBOARD_PASSWORD}' | base64 -d; echo
+```
+
+ArgoCD's admin password:
 
 ```bash
 kubectl -n argocd get secret argocd-initial-admin-secret \
@@ -246,13 +259,15 @@ cloud secret manager, plus secret scanning in CI.
 Deliberately honest — the gap between the diagram and the code is usually the interesting
 conversation.
 
-- **Incidents are in-memory.** A dict in the agent process, lost on restart. This is why
-  the deployment is pinned to `replicas: 1`.
+- **Single replica.** Incidents persist to SQLite on a volume and are kept for 7 days, but
+  SQLite is single-writer, so the agent still runs as one replica.
 - **No verification step.** After remediating, the status goes to `RESOLVED` based only on
   whether the K8s patch call threw. Nothing re-checks that the alert actually cleared.
-- **The model under-uses `adjust_resources`.** In the OOM scenario it recommended `manual`
-  three times where raising the memory limit was the fix — a prompt-tuning issue, not a
-  code bug.
+- **One fault can raise several incidents.** `PodCrashLoopBackOff` and `PodNotReady` for
+  the same pod each propose a rollback. Approve only one — a second rollback undoes the
+  first.
+- **The model under-uses `adjust_resources`.** In the OOM scenario it has recommended
+  `manual`, and later `rollback_deployment`, but never raised the memory limit itself.
 - **No ImagePullBackOff alert rule.** A completely broken deployment is caught only
   indirectly, by `PodNotReady`, after two minutes.
 - **Single watched namespace**, and **ephemeral storage** — PostgreSQL and Loki both use
@@ -260,7 +275,7 @@ conversation.
 
 ### What I'd build next
 
-1. Persist incidents so history survives restarts and the agent can scale out
+1. Move incidents to a shared database so the agent can scale out
 2. A verification loop — re-check the alert after remediating, mark `FAILED` and roll back
    if it did not clear
 3. Confidence-gated auto-remediation: skip approval only for low-risk, high-confidence,

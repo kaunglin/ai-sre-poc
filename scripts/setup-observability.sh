@@ -9,6 +9,15 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Create monitoring namespace
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
+# Bearer token AlertManager sends to the AI SRE agent's webhook. Created before
+# the Helm install because AlertManager mounts it (alertmanagerSpec.secrets) and
+# its pod cannot start without it. Created once; deploy-ai-agent.sh copies it.
+if ! kubectl -n monitoring get secret ai-sre-webhook >/dev/null 2>&1; then
+  echo "Creating AlertManager → agent webhook token..."
+  kubectl -n monitoring create secret generic ai-sre-webhook \
+    --from-file=token=<(openssl rand -hex 32 | tr -d '\n')
+fi
+
 # Add Helm repos
 echo "Adding Helm repos..."
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
