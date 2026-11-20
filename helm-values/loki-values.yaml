@@ -2,6 +2,10 @@
 
 loki:
   enabled: true
+  # The chart provisions its Grafana datasource with isDefault: true, and so does
+  # kube-prometheus-stack for Prometheus. Grafana refuses two defaults per org and
+  # crash-loops ("Only one datasource per organization can be marked as default").
+  isDefault: false
   # The loki-stack chart pins grafana/loki:2.6.1, which predates `store: tsdb`
   # (2.8+) and `schema: v13` (2.9+) configured below — it crash-loops with
   # "invalid schema config: invalid schema version". Align the image with the

@@ -110,6 +110,10 @@ Senior Cloud DevOps roles. The entire stack runs locally on a laptop using k3d (
 > explicit `image.tag: 2.9.8`, plus `tsdb_shipper.{active_index_directory,
 > cache_location,shared_store}` and `compactor.working_directory` — all four
 > default to empty strings and fail with `mkdir : no such file or directory`.
+> It also sets `loki.isDefault: false`: the chart provisions its Grafana datasource as
+> the default, and so does kube-prometheus-stack for Prometheus. Grafana allows one
+> default per org and crash-loops otherwise ("Only one datasource per organization can
+> be marked as default").
 > Migrating to the current `grafana/loki` chart in SingleBinary mode is the real fix.
 
 > **On ArgoCD sync policy.** Sync is deliberately manual. An automated policy with
@@ -128,6 +132,7 @@ ai-sre-poc/
 ├── README.md                                    # Overview, architecture, setup
 ├── TESTING.md                                   # Chaos scenarios, verification, troubleshooting
 ├── .gitignore                                   # excludes __pycache__, .ruff_cache, .DS_Store
+├── ruff.toml                                    # Pins the lint rule set CI runs
 │
 ├── apps/                                        # Application source code
 │   ├── order-service/                           # Main backend API
@@ -153,6 +158,10 @@ ai-sre-poc/
 │   │   └── all.yaml                             # RBAC, ConfigMap, Deployment, Service (NO Secret — see below)
 │   ├── alerting/
 │   │   └── prometheus-rules.yaml                # PrometheusRule CRDs for custom alerts
+│   ├── ingress/
+│   │   ├── apps.yaml                            # orders.localhost
+│   │   ├── monitoring.yaml                      # grafana / prometheus / alertmanager.localhost
+│   │   └── argocd.yaml                          # argocd.localhost
 │   └── argocd/
 │       └── application.yaml                     # ArgoCD Application (set repoURL to your remote)
 │
@@ -179,11 +188,17 @@ ai-sre-poc/
 ```
 
 > **Why there is no Secret in `k8s/ai-sre-agent/all.yaml`.** `deploy-ai-agent.sh`
-> creates `ai-sre-agent-secret` from the API key in your environment, then applies
-> this manifest. A placeholder Secret in the file would overwrite the real key on
-> every apply — and again on every ArgoCD sync. The Deployment's `secretRef` is
-> marked `optional: true` so the agent still starts without it and reports
-> "no API key" rather than crash-looping.
+> creates `ai-sre-agent-secret`, then applies this manifest. A placeholder Secret in
+> the file would overwrite the real values on every apply — and again on every ArgoCD
+> sync. The Deployment's `secretRef` is marked `optional: true` so the agent still
+> starts without it and reports "no API key" rather than crash-looping.
+>
+> The Secret holds `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DASHBOARD_PASSWORD`,
+> `SESSION_SECRET` and `WEBHOOK_TOKEN`. The script **merges**: any value not supplied
+> in the environment is kept from the existing Secret, and the password and session key
+> are generated only the first time. An earlier version rebuilt the Secret from the
+> shell alone, so running it without the API key exported silently replaced a working
+> key with `not-set`.
 
 ---
 
@@ -290,12 +305,42 @@ otherwise freeze the dashboard and the webhook endpoint for the whole investigat
 > block a genuine re-fire of the same alert.
 
 **Webhook endpoint:**
-- `POST /webhook/alertmanager` — receives AlertManager alert payloads
+- `POST /webhook/alertmanager` — receives AlertManager alert payloads. Requires
+  `Authorization: Bearer <WEBHOOK_TOKEN>` when the token is configured.
+
+> **Why the webhook has its own token.** It cannot use the dashboard session, and the
+> Ingress routes every path — so without a token anyone who can reach
+> `ai-sre.localhost:18080` could inject incidents. The token lives in
+> `monitoring/ai-sre-webhook` (created by `setup-observability.sh`, *before* the Helm
+> install, because AlertManager mounts it via `alertmanagerSpec.secrets` and its pod
+> cannot start without it). AlertManager reads it through `http_config.authorization.
+> credentials_file`; `deploy-ai-agent.sh` copies it into the agent's Secret. If the
+> token is missing the agent logs a warning and accepts unauthenticated calls.
 
 Duplicate suppression keys on `(alertname, namespace, pod)`. Keying on `alertname` alone
-would discard a second pod's crash-loop as a duplicate of the first. Because the incident
-store is an in-memory dict, this dedup is per-process — another reason the Deployment is
-pinned to `replicas: 1`.
+would discard a second pod's crash-loop as a duplicate of the first. The dedup reads the
+in-process working set, so it is per-process — another reason the Deployment is pinned to
+`replicas: 1`.
+
+**Incident persistence.** The in-memory dict is the working copy; SQLite at
+`$DATA_DIR/incidents.db` (a 1Gi `ReadWriteOnce` PVC on k3d's local-path provisioner) is
+the durable copy it is rebuilt from at startup.
+
+- **Saving is driven by attribute assignment, not save() calls.** `Incident.__setattr__`
+  marks the incident dirty and a background task flushes dirty incidents once a second
+  (and once more on shutdown). A new code path that mutates an incident cannot forget to
+  persist it. `add_event()` assigns `updated_at`, so timeline appends are covered.
+- **Restart recovery.** An incident caught in `INVESTIGATING` is resumed — its analysis
+  was going to run anyway. One caught in `APPROVED`/`EXECUTING` is marked `FAILED`: the
+  patch may or may not have landed, and re-running it blind is exactly what needs a human.
+- **Retention is 7 days** (`HISTORY_DAYS`), enforced at startup and hourly, in memory and
+  on disk. It is also the widest window `GET /api/incidents` accepts — there is nothing
+  older to return.
+- **`strategy: Recreate`.** A rolling update would start the new pod while the old one
+  still holds the RWO volume and is still writing SQLite.
+
+Local-path volumes live on one node's disk: history survives pod restarts and redeploys,
+not `k3d cluster delete`.
 
 **Investigation pipeline (runs async on each new alert):**
 1. Parse alert labels and annotations
@@ -358,13 +403,61 @@ current count and adds one. The previous `params.get("replicas", 3)` meant an om
 field would silently scale a database to three instances — each with its own `emptyDir`,
 so three independent databases behind one Service.
 
-**Dashboard endpoints:**
+**Dashboard endpoints** (all require a signed-in session):
 - `GET /` — web dashboard (dark theme, auto-refreshes every 5s)
-- `GET /api/incidents` — list all incidents
+- `GET /api/incidents?since=&until=&q=` — incidents created in the window, newest first.
+  ISO 8601 timestamps; defaults to the last 7 days. `400` if the window is wider than 7
+  days, starts more than 7 days ago, or is inverted. `q` is a search: every
+  whitespace-separated term must appear (AND, case-insensitive, max 8 terms) somewhere in
+  the alert name, pod, ID, namespace, summary, description, root cause, analysis,
+  recommended action, timeline — or the **gathered evidence** (`logs_context`, the Loki
+  lines, and `k8s_context`, pod states and events). Each hit carries
+  `match: {field, snippet}`, the line where the first term was found, because the evidence
+  fields are not shown on the card
 - `GET /api/incidents/{id}` — single incident detail
 - `POST /api/incidents/{id}/approve` — approve and execute remediation
-- `POST /api/incidents/{id}/reject` — reject, mark for manual handling
+- `POST /api/incidents/{id}/reject` — reject, mark for manual handling (only while
+  `AWAITING_APPROVAL`)
+- `POST /api/incidents/{id}/reinvestigate`, `GET|POST /api/config` — tool-calling mode
 - `POST /api/test-alert` — trigger a fake alert for testing the pipeline
+- `GET /api/me` — the signed-in user
+
+**Public:** `GET|POST /login`, `/healthz`, `/metrics`, and the webhook (its own token).
+`POST /logout` clears the session.
+
+**Sign-in.** One user, `DASHBOARD_USERNAME` (default `admin`), password from
+`DASHBOARD_PASSWORD` in the Secret. Sessions are Starlette's signed cookie
+(`itsdangerous`), 12 hours, keyed by `SESSION_SECRET` — kept stable by the deploy script
+so a redeploy does not sign everyone out. Details that matter:
+
+- **Fails closed.** No `DASHBOARD_PASSWORD` → every login returns `503`. An approve button
+  open to anyone on the network is worse than a dashboard nobody can reach.
+- **`SameSite=strict`** keeps the cookie off cross-site requests — that is what stops
+  another page from POSTing `/approve` in a signed-in engineer's browser.
+- Both fields are compared with `hmac.compare_digest`, always, and a failure waits 1s.
+- `https_only=False` because the Ingress is plain `http://*.localhost`. Flip it behind TLS.
+- Approve/reject record the user in the timeline (`Remediation approved by admin`).
+
+**Dashboard UI.** Approve and reject open an in-page dialog, not the browser's
+`confirm()`: it shows the action and every parameter, the model's confidence and risk,
+focuses **Cancel** (Enter does not execute), traps Tab, and stays open showing
+"Executing…" until the API returns; the result arrives as a toast. The time-range bar
+offers 1h / 6h / 24h / 3d / 7d presets (relative — they slide forward on each refresh;
+the choice is remembered in `localStorage`) and a custom From/To range with the same
+7-day rules as the API, checked client-side first. Any `401` sends the browser to
+`/login`.
+
+The search box (focus it with `/`, clear with Esc) queries the server 250 ms after typing
+stops and combines with the time range. The client only highlights: `hl()` splits the raw
+text on a capture group of the terms and escapes every piece separately, so highlighting
+can never splice markup into untrusted incident text.
+
+Each card can be **minimised** (header, ID, one-line root cause and any search snippet)
+or **maximised** (a full-page view, closed with Esc or ✕, focus returned to the card).
+Open incidents start expanded and closed ones minimised; a manual toggle overrides that
+per incident and is kept in `localStorage`, so the 5-second refresh — which re-renders
+the list — does not undo it. The maximised view re-renders on each refresh too, so a
+status change shows up while you read.
 
 **Access:** an Ingress (`ai-sre.localhost`, via ingress-nginx on host port 18080) rather
 than a port-forward. A port-forward is a single TCP tunnel bound to one pod and dies when
@@ -372,7 +465,16 @@ that pod is replaced — which is exactly when a remediation is being watched.
 
 **RBAC:** The agent runs with a ServiceAccount that has:
 - Read access: pods, pods/log, events, services, configmaps, namespaces, HPA
-- Read + patch: deployments, replicasets, statefulsets
+- Read: replicasets (rollback reads the previous revision), statefulsets
+- Read + patch: deployments — the only write the agent makes
+
+> **No `update`, and `patch` only on Deployments.** Every remediation is a
+> `patch_namespaced_deployment` call, so granting `update` (full replace) or write access
+> to ReplicaSets and StatefulSets only widened the blast radius. Note that RBAC cannot
+> restrict *which fields* a patch touches — a patch can change an image as easily as a
+> replica count. The fixed action vocabulary is what bounds the patch body; RBAC bounds
+> which objects it can land on. The role is still a `ClusterRole`; a namespaced `Role`
+> in `WATCH_NAMESPACE` would shrink it further.
 
 ---
 
@@ -432,9 +534,9 @@ that pod is replaced — which is exactly when a remediation is being watched.
 
 Each scenario is designed to trigger specific alerts and test the AI agent's investigation pipeline.
 
-> **Verification status:** Scenario 1 has been run end to end and its documented behaviour
-> is observed, not assumed. Scenarios 2–4 are derived from the code and alert rules but
-> have **not** been verified in a full run — treat their expected alerts and actions as
+> **Verification status:** Scenarios 1 and 2 have been run end to end and their documented
+> behaviour is observed, not assumed. Scenarios 3–4 are derived from the code and alert rules
+> but have **not** been verified in a full run — treat their expected alerts and actions as
 > predictions. `TESTING.md` carries the same markers and the verification commands.
 
 ### Scenario 1: CrashLoopBackOff
@@ -471,6 +573,22 @@ restart-based rules fire here and cannot there.
 > are confident… for complex or risky situations, recommend manual"* appears to push it
 > toward caution. Prompt tuning, not a code bug — but it means the project's flagship
 > `adjust_resources` path is currently unexercised by its own scenario.
+
+> **Second run (2026-11-20), after the prompt began listing each action's parameters.**
+> The failure looked different: the container was not `OOMKilled` — Uvicorn's worker
+> processes died and the parent exited `Completed` — so `PodOOMKilled` never fired. The
+> agent received `PodCrashLoopBackOff`, `PodNotReady` and `HighPodRestartRate` (the last
+> auto-resolved). Both live incidents recommended `rollback_deployment` (confidence high,
+> risk low) rather than `manual`, and the approved rollback restored the 256Mi limit. A
+> valid fix — but the root-cause text described "workers die" without naming the 32Mi
+> limit, and `adjust_resources` was still not chosen. One run; treat it as a signal.
+>
+> **New gap this exposed: one fault, several approvable incidents.** Dedup keys on
+> `(alertname, namespace, pod)`, so `PodCrashLoopBackOff` and `PodNotReady` for the same
+> pod are separate incidents, each proposing `rollback_deployment`. Approving **both**
+> rolls back twice — and the second rollback undoes the first, restoring the broken
+> revision. Correlating incidents by target deployment (or refusing a second remediation
+> on a deployment patched in the last few minutes) would close it.
 
 ### Scenario 3: High latency
 **Script:** `scripts/chaos/inject-latency.sh`
@@ -530,6 +648,11 @@ single pod and dies whenever that pod is replaced — i.e. right when a remediat
 | `SLACK_WEBHOOK_URL` | (none)                                                          | No       |
 | `WATCH_NAMESPACE`   | `apps`                                                          | No       |
 | `CLAUDE_MODEL`      | `claude-opus-5`                                                 | No       |
+| `DASHBOARD_USERNAME`| `admin`                                                         | No       |
+| `DASHBOARD_PASSWORD`| (none — sign-in refused)                                        | Yes, to sign in |
+| `SESSION_SECRET`    | random per process (restarts sign everyone out)                 | No       |
+| `WEBHOOK_TOKEN`     | (none — webhook unauthenticated, warning logged)                | Recommended |
+| `DATA_DIR`          | `/data`                                                         | No       |
 
 ### Order Service
 | Variable       | Default                                     | Required |
@@ -621,9 +744,11 @@ Agent executes remediation → Incident resolved
 Ordered by how much they limit the PoC. The first four are the ones a reviewer will
 notice; `README.md` carries a shorter version of this list.
 
-**1. Incidents are in-memory.** A dict in the agent process, lost on restart. Forces
-`replicas: 1`, since two replicas would each hold half the incidents and both
-investigate every alert. Persisting to PostgreSQL unblocks scaling out.
+**1. Single replica.** Incidents now persist (SQLite on a PVC, 7-day retention), so a
+restart no longer loses history. But SQLite on a `ReadWriteOnce` volume is single-writer,
+and the dedup filter and investigation tasks still work from one process's memory — so
+the agent stays at `replicas: 1`. A shared database (PostgreSQL) plus a lock or queue for
+"who investigates this alert" is what unblocks scaling out.
 
 **2. No verification step.** After a remediation the status goes to `RESOLVED` based
 solely on whether the K8s patch call threw. Nothing re-checks that the alert cleared.
@@ -632,13 +757,20 @@ the README's original claim that the agent "confirms the fix resolved the issue"
 never true. The fix: re-query the alert after a grace period, mark `RESOLVED` only when
 it clears, and auto-rollback when it doesn't.
 
+**2b. One fault can produce several approvable remediations.** Different alerts for the
+same broken deployment become separate incidents, each proposing its own patch. Approving
+two `rollback_deployment`s rolls back twice, and the second one restores the broken
+revision. See scenario 2. Correlate by target deployment, or refuse a remediation on a
+deployment patched in the last few minutes.
+
 **3. No ImagePullBackOff alert rule.** See the coverage-gap note under Alert rules.
 
 **4. Single watched namespace.** `WATCH_NAMESPACE` is one string, though RBAC is
 cluster-wide.
 
-**5. The model under-uses automated actions.** In the OOM scenario it recommended `manual`
-three times where `adjust_resources` was the correct fix. Approving `manual` is a no-op by
+**5. The model under-uses automated actions.** In the first OOM run it recommended `manual`
+three times where `adjust_resources` was the correct fix (the second run chose
+`rollback_deployment` — see scenario 2). Approving `manual` is a no-op by
 design, so the incident is left to a human — safe, but it means the automation rarely
 engages. Worth A/B testing a less cautious phrasing of the action-selection guidance.
 
@@ -647,9 +779,10 @@ engages. Worth A/B testing a less cautious phrasing of the action-selection guid
 **7. Deprecated Loki chart.** Works with an explicit image pin; migrating to
 `grafana/loki` SingleBinary is the real fix.
 
-**8. Unpinned `ruff` in CI.** The workflow runs `pip install ruff`, so a new release can
-change the default rule set and fail the lint job without any code change. Pin the
-version or commit a `ruff.toml`.
+**8. Unpinned `ruff` version in CI.** The workflow runs `pip install ruff`. The rule set
+is now pinned by `ruff.toml` (`E4`, `E7`, `E9`, `F`, `I`), so a new release can no longer
+change which rules run — but the ruff version itself is still floating, so a rule's
+behaviour can still shift between releases. Pin it in the workflow to close this fully.
 
 ### Ideas not yet started
 

@@ -654,10 +654,25 @@ kubectl get secret alertmanager-kube-prometheus-stack-alertmanager -n monitoring
   -o jsonpath='{.data.alertmanager\.yaml\.gz}' | base64 -d | gunzip
 ```
 
-Incidents live in memory, so clearing the noise is a restart:
+Incidents persist for 7 days, so a restart no longer clears them. To wipe the history,
+delete the database file and restart:
 ```bash
+kubectl exec -n ai-sre-agent deploy/ai-sre-agent -- rm -f /data/incidents.db /data/incidents.db-wal /data/incidents.db-shm
 kubectl rollout restart deployment/ai-sre-agent -n ai-sre-agent
 ```
+
+### Webhook calls are rejected with 401
+
+The agent logs `Rejected webhook call with a missing or wrong bearer token`. AlertManager
+and the agent hold different tokens — usually because `monitoring/ai-sre-webhook` was
+recreated after the agent was deployed. Re-run `./scripts/deploy-ai-agent.sh`; it copies
+the current token into the agent's Secret and restarts it.
+
+### Sign-in returns "Sign-in is not configured"
+
+`DASHBOARD_PASSWORD` is missing from `ai-sre-agent-secret` — the Secret predates the
+login feature. Re-run `./scripts/deploy-ai-agent.sh`; it generates one and keeps every
+other value.
 
 ---
 
@@ -665,15 +680,22 @@ kubectl rollout restart deployment/ai-sre-agent -n ai-sre-agent
 
 The agent's own API:
 
+The API needs a signed-in session. Sign in once with curl and reuse the cookie:
+
 ```bash
-# all incidents
-kubectl exec -n monitoring loki-0 -- \
-  wget -qO- http://ai-sre-agent.ai-sre-agent:5000/api/incidents | python3 -m json.tool
+PW=$(kubectl -n ai-sre-agent get secret ai-sre-agent-secret -o jsonpath='{.data.DASHBOARD_PASSWORD}' | base64 -d)
+curl -s -c /tmp/ai-sre.jar -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$PW\"}" http://ai-sre.localhost:18080/login; unset PW
+
+# incidents from the last 24 hours (window: at most 7 days)
+curl -s -b /tmp/ai-sre.jar "http://ai-sre.localhost:18080/api/incidents?since=$(date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)" \
+  | python3 -m json.tool
 
 # trigger a synthetic incident without breaking anything
-kubectl exec -n monitoring loki-0 -- \
-  wget -qO- --post-data='' http://ai-sre-agent.ai-sre-agent:5000/api/test-alert
+curl -s -b /tmp/ai-sre.jar -X POST http://ai-sre.localhost:18080/api/test-alert
 ```
+
+(`date -v-24H` is macOS; on Linux use `date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ`.)
 
 Loki:
 
